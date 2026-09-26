@@ -229,6 +229,12 @@ public data class NativeOpenPgpCertificateResolution(
 public enum class NativeOpenPgpKeyKind {
     LEGACY_ED25519_X25519,
     RSA,
+    ED25519_X25519,
+}
+
+public enum class NativeOpenPgpKeyVersion {
+    V4,
+    V6,
 }
 
 public class NativeOpenPgpKeyMaterial(
@@ -851,6 +857,7 @@ public object NativeCryptoOpenPgp {
         rsaBits: Int = 0,
         creationTimeEpochSeconds: Long,
         expirationSeconds: Long? = null,
+        version: NativeOpenPgpKeyVersion = NativeOpenPgpKeyVersion.V4,
     ): NativeOpenPgpKeyMaterial {
         require(userId.isNotBlank()) { "OpenPGP user ID must not be blank" }
         require(creationTimeEpochSeconds >= 0L) { "OpenPGP creation time must not be negative" }
@@ -858,7 +865,8 @@ public object NativeCryptoOpenPgp {
             "OpenPGP expiration must fit an unsigned 32-bit duration"
         }
         when (kind) {
-            NativeOpenPgpKeyKind.LEGACY_ED25519_X25519 ->
+            NativeOpenPgpKeyKind.LEGACY_ED25519_X25519,
+            NativeOpenPgpKeyKind.ED25519_X25519 ->
                 require(rsaBits == 0) { "RSA bits must be zero for a modern OpenPGP key" }
 
             NativeOpenPgpKeyKind.RSA ->
@@ -866,6 +874,11 @@ public object NativeCryptoOpenPgp {
                     "Unsupported OpenPGP RSA size"
                 }
         }
+        require(
+            kind == NativeOpenPgpKeyKind.RSA ||
+                (kind == NativeOpenPgpKeyKind.LEGACY_ED25519_X25519 && version == NativeOpenPgpKeyVersion.V4) ||
+                (kind == NativeOpenPgpKeyKind.ED25519_X25519 && version == NativeOpenPgpKeyVersion.V6),
+        ) { "OpenPGP key kind does not match its certificate version" }
         val payload = NativeCrypto.call(
             operationName = "open_pgp_key_generate",
             operation = OpenPgpKeyGenerateOperationProto(
@@ -875,11 +888,16 @@ public object NativeCryptoOpenPgp {
                             OpenPgpKeyKindProto.LEGACY_ED25519_X25519
 
                         NativeOpenPgpKeyKind.RSA -> OpenPgpKeyKindProto.RSA
+                        NativeOpenPgpKeyKind.ED25519_X25519 -> OpenPgpKeyKindProto.ED25519_X25519
                     },
                     userId = userId,
                     rsaBits = rsaBits,
                     creationTimeEpochSeconds = creationTimeEpochSeconds,
                     expirationSeconds = expirationSeconds?.toUInt(),
+                    version = when (version) {
+                        NativeOpenPgpKeyVersion.V4 -> OpenPgpKeyVersionProto.V4
+                        NativeOpenPgpKeyVersion.V6 -> OpenPgpKeyVersionProto.V6
+                    },
                 ),
             ),
         ).requireBytes("open_pgp_key_generate")
@@ -1994,32 +2012,8 @@ internal fun OpenPgpCertificateMaterialReconcileResultProto.toPublicCertificateM
         }
 
         is OpenPgpCertificateMaterialReconcileErrorOutcomeProto -> {
-            val value = outcome.value
-            val existingPublic = value.existingPublicInputError.toPublicCertificateInputError()
-            val incomingPublic = value.incomingPublicInputError.toPublicCertificateInputError()
-            val existingSecret = value.existingSecretInputError.toPublicCertificateInputError()
-            val incomingSecret = value.incomingSecretInputError.toPublicCertificateInputError()
-            val pair = value.pairError.toPublicCertificatePairError()
-            val hasInputError =
-                existingPublic != null ||
-                    incomingPublic != null ||
-                    existingSecret != null ||
-                    incomingSecret != null
-            if (hasInputError == (pair != null)) malformedOpenPgp(operation)
             NativeOpenPgpCertificateMaterialReconcileResult.Error(
-                failure =
-                    if (hasInputError) {
-                        NativeOpenPgpCertificateMaterialReconcileFailure.InvalidInputs(
-                            existingPublic = existingPublic,
-                            incomingPublic = incomingPublic,
-                            existingSecret = existingSecret,
-                            incomingSecret = incomingSecret,
-                        )
-                    } else {
-                        NativeOpenPgpCertificateMaterialReconcileFailure.Pair(
-                            pair ?: malformedOpenPgp(operation),
-                        )
-                    },
+                failure = outcome.value.toPublicCertificateMaterialReconcileFailure(operation),
             )
         }
 
@@ -2043,7 +2037,9 @@ internal fun OpenPgpCertificateMaterialReconcileV2ResultProto
             )
 
         is OpenPgpCertificateMaterialReconcileV2ErrorOutcomeProto ->
-            outcome.value.toPublicCertificateMaterialReconcileV2Error(operation)
+            NativeOpenPgpCertificateMaterialReconcileV2Result.Error(
+                failure = outcome.value.toPublicCertificateMaterialReconcileFailure(operation),
+            )
 
         null -> malformedOpenPgp(operation)
     }
@@ -2198,9 +2194,9 @@ private fun OpenPgpCertificateMaterialContributionsProto.toPublicCertificateMate
 }
 
 private fun OpenPgpCertificateMaterialReconcileErrorProto
-    .toPublicCertificateMaterialReconcileV2Error(
+    .toPublicCertificateMaterialReconcileFailure(
         operation: String,
-    ): NativeOpenPgpCertificateMaterialReconcileV2Result.Error {
+    ): NativeOpenPgpCertificateMaterialReconcileFailure {
     val existingPublic = existingPublicInputError.toPublicCertificateInputError()
     val incomingPublic = incomingPublicInputError.toPublicCertificateInputError()
     val existingSecret = existingSecretInputError.toPublicCertificateInputError()
@@ -2214,14 +2210,13 @@ private fun OpenPgpCertificateMaterialReconcileErrorProto
     )
     val hasInputError = inputFailure.hasAnyInputError()
     if (hasInputError == (pair != null)) malformedOpenPgp(operation)
-    val failure = if (hasInputError) {
+    return if (hasInputError) {
         inputFailure
     } else {
         NativeOpenPgpCertificateMaterialReconcileFailure.Pair(
             pair ?: malformedOpenPgp(operation),
         )
     }
-    return NativeOpenPgpCertificateMaterialReconcileV2Result.Error(failure)
 }
 
 private fun NativeOpenPgpCertificateMaterialReconcileFailure.InvalidInputs.hasAnyInputError(): Boolean =
@@ -3370,13 +3365,7 @@ private fun requireOpenPgpKeyId(operation: String, value: String) {
 }
 
 private fun requireOpenPgpFingerprint(operation: String, value: String) {
-    if (
-        value.length !in OPEN_PGP_MIN_FINGERPRINT_HEX_CHARS..OPEN_PGP_MAX_FINGERPRINT_HEX_CHARS ||
-        value.length % 2 != 0 ||
-        !value.isUpperHex()
-    ) {
-        malformedOpenPgp(operation)
-    }
+    if (!value.isValidOpenPgpFingerprint()) malformedOpenPgp(operation)
 }
 
 private fun requireOpenPgpKeygrip(operation: String, value: String?) {
